@@ -11,9 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       controller_dockerhub_image_name: docker.io/josvaz/sealed-secrets-controller
-      controller_ghcr_image_name: ghcr.io/josvaz/sealed-secrets-controller
+      controller_ghcr_image_name: ghcr.io/josvazg/sealed-secrets-controller
       kubeseal_dockerhub_image_name: docker.io/josvaz/sealed-secrets-kubeseal
-      kubeseal_ghcr_image_name: ghcr.io/josvaz/sealed-secrets-kubeseal
+      kubeseal_ghcr_image_name: ghcr.io/josvazg/sealed-secrets-kubeseal
     steps:
       # Checkout and set env
       - name: Checkout
