@@ -4,7 +4,7 @@ name: Release
 on:
   push:
     branch:
-      - 'release/v[0-9]+.[0-9]+.[0-9]+'
+      - 'release\/v[0-9]+.[0-9]+.[0-9]+'
 
 jobs:
   build:
