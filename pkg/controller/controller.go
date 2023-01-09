@@ -66,10 +66,12 @@ type Controller struct {
 	queue       workqueue.RateLimitingInterface
 	ssInformer  cache.SharedIndexInformer
 	sInformers  map[string]*secretInformer
+	clientset   kubernetes.Interface
 	sclient     v1.SecretsGetter
 	ssclient    ssv1alpha1client.SealedSecretsGetter
 	recorder    record.EventRecorder
 	keyRegistry *KeyRegistry
+	tweakopts   internalinterfaces.TweakListOptionsFunc
 
 	oldGCBehavior bool // feature flag to revert to old behavior where we delete the secrets instead of relying on owners reference.
 	updateStatus  bool // feature flag that enables updating the status subresource.
@@ -95,115 +97,125 @@ func NewController(clientset kubernetes.Interface, ssclientset ssclientset.Inter
 		SealedSecrets().
 		Informer()
 
+	controller := &Controller{
+		ssInformer:  ssInformer,
+		sInformers:  sInformers,
+		queue:       queue,
+		clientset:   clientset,
+		sclient:     clientset.CoreV1(),
+		ssclient:    ssclientset.BitnamiV1alpha1(),
+		recorder:    recorder,
+		keyRegistry: keyRegistry,
+		tweakopts:   tweakopts,
+	}
+
 	_, err := ssInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			key, err := cache.MetaNamespaceKeyFunc(obj)
-			if err == nil {
-				queue.Add(key)
-				ns, _, err := cache.SplitMetaNamespaceKey(key)
-				if err != nil {
-					log.Printf("failed to get namespace and name from key: %v", err)
-					return
-				}
-				if _, ok := sInformers[ns]; !ok {
-					// chache.Indexers intitialization: https://github.com/kubernetes/client-go/blob/e7cd4ba474b5efc2882e377362c9aa8b407428d9/informers/core/v1/secret.go#L81
-					inf := corev1informers.NewFilteredSecretInformer(clientset, ns, 0, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, tweakopts)
-					stopCh := make(chan struct{})
-
-					_, err = inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-						DeleteFunc: func(obj interface{}) {
-							skey, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-							if err != nil {
-								log.Printf("failed to fetch Secret key: %v", err)
-								return
-							}
-
-							ns, name, err := cache.SplitMetaNamespaceKey(skey)
-							if err != nil {
-								log.Printf("failed to get namespace and name from key: %v", err)
-								return
-							}
-
-							ssecret, err := ssclientset.BitnamiV1alpha1().SealedSecrets(ns).Get(context.Background(), name, metav1.GetOptions{})
-							if err != nil {
-								if !k8serrors.IsNotFound(err) {
-									log.Printf("failed to get SealedSecret: %v", err)
-								}
-								return
-							}
-
-							if !metav1.IsControlledBy(obj.(*corev1.Secret), ssecret) && !isAnnotatedToBeManaged(obj.(*corev1.Secret)) {
-								return
-							}
-
-							sskey, err := cache.MetaNamespaceKeyFunc(ssecret)
-							if err != nil {
-								log.Printf("failed to fetch SealedSecret key: %v", err)
-								return
-							}
-
-							queue.Add(sskey)
-						},
-					})
-					if err != nil {
-						log.Printf("could not add event handler to secrets informer: %v", err)
-						return
-					}
-
-					sInformers[ns] = &secretInformer{
-						informer: inf,
-						stopCh:   stopCh,
-					}
-
-					go sInformers[ns].informer.Run(sInformers[ns].stopCh)
-				}
-			}
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			key, err := cache.MetaNamespaceKeyFunc(newObj)
-			if err == nil {
-				queue.Add(key)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-			if err == nil {
-				queue.Add(key)
-				ns, _, err := cache.SplitMetaNamespaceKey(key)
-				if err != nil {
-					log.Printf("failed to get namespace and name from key: %v", err)
-					return
-				}
-				ssecrets, err := ssclientset.BitnamiV1alpha1().SealedSecrets(ns).List(context.Background(), metav1.ListOptions{})
-				if err != nil {
-					log.Printf("printing error: %v", err)
-				}
-				if len(ssecrets.Items) > 0 {
-					return
-				}
-				if inf, ok := sInformers[ns]; ok {
-					close(inf.stopCh)
-					delete(sInformers, ns)
-				}
-			}
-			if ssecret, ok := obj.(*ssv1alpha1.SealedSecret); ok {
-				UnregisterCondition(ssecret)
-			}
-		},
+		AddFunc: controller.add,
+		UpdateFunc: controller.update,
+		DeleteFunc: controller.delete,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("could not add event handler to sealed secrets informer: %w", err)
 	}
 
-	return &Controller{
-		ssInformer:  ssInformer,
-		sInformers:  sInformers,
-		queue:       queue,
-		sclient:     clientset.CoreV1(),
-		ssclient:    ssclientset.BitnamiV1alpha1(),
-		recorder:    recorder,
-		keyRegistry: keyRegistry,
-	}, nil
+	return controller, nil
+}
+
+func (c *Controller) add(obj interface{}) {
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err == nil {
+		c.queue.Add(key)
+		ns, _, err := cache.SplitMetaNamespaceKey(key)
+		if err != nil {
+			log.Printf("failed to get namespace and name from key: %v", err)
+			return
+		}
+		if _, ok := c.sInformers[ns]; !ok {
+			// cache.Indexers initialization: https://github.com/kubernetes/client-go/blob/e7cd4ba474b5efc2882e377362c9aa8b407428d9/informers/core/v1/secret.go#L81
+			inf := corev1informers.NewFilteredSecretInformer(c.clientset, ns, 0, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, c.tweakopts)
+			stopCh := make(chan struct{})
+
+			_, err = inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+				DeleteFunc: func(obj interface{}) {
+					skey, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+					if err != nil {
+						log.Printf("failed to fetch Secret key: %v", err)
+						return
+					}
+
+					ns, name, err := cache.SplitMetaNamespaceKey(skey)
+					if err != nil {
+						log.Printf("failed to get namespace and name from key: %v", err)
+						return
+					}
+
+					ssecret, err := c.ssclient.SealedSecrets(ns).Get(context.Background(), name, metav1.GetOptions{})
+					if err != nil {
+						if !k8serrors.IsNotFound(err) {
+							log.Printf("failed to get SealedSecret: %v", err)
+						}
+						return
+					}
+
+					if !metav1.IsControlledBy(obj.(*corev1.Secret), ssecret) && !isAnnotatedToBeManaged(obj.(*corev1.Secret)) {
+						return
+					}
+
+					sskey, err := cache.MetaNamespaceKeyFunc(ssecret)
+					if err != nil {
+						log.Printf("failed to fetch SealedSecret key: %v", err)
+						return
+					}
+
+					c.queue.Add(sskey)
+				},
+			})
+			if err != nil {
+				log.Printf("could not add event handler to secrets informer: %v", err)
+				return
+			}
+
+			c.sInformers[ns] = &secretInformer{
+				informer: inf,
+				stopCh:   stopCh,
+			}
+
+			go c.sInformers[ns].informer.Run(c.sInformers[ns].stopCh)
+		}
+	}
+}
+
+func (c *Controller) update(oldObj, newObj interface{}) {
+	key, err := cache.MetaNamespaceKeyFunc(newObj)
+	if err == nil {
+		c.queue.Add(key)
+	}
+}
+
+func(c *Controller) delete(obj interface{}) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err == nil {
+		c.queue.Add(key)
+		ns, _, err := cache.SplitMetaNamespaceKey(key)
+		if err != nil {
+			log.Printf("failed to get namespace and name from key: %v", err)
+			return
+		}
+		ssecrets, err := c.ssclient.SealedSecrets(ns).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			log.Printf("printing error: %v", err)
+		}
+		if len(ssecrets.Items) > 0 {
+			return
+		}
+		if inf, ok := c.sInformers[ns]; ok {
+			close(inf.stopCh)
+			delete(c.sInformers, ns)
+		}
+	}
+	if ssecret, ok := obj.(*ssv1alpha1.SealedSecret); ok {
+		UnregisterCondition(ssecret)
+	}
 }
 
 // HasSynced returns true once this controller has completed an
