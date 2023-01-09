@@ -110,7 +110,7 @@ func NewController(clientset kubernetes.Interface, ssclientset ssclientset.Inter
 	}
 
 	_, err := ssInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.add,
+		AddFunc:    controller.add,
 		UpdateFunc: controller.update,
 		DeleteFunc: controller.delete,
 	})
@@ -136,39 +136,7 @@ func (c *Controller) add(obj interface{}) {
 			stopCh := make(chan struct{})
 
 			_, err = inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-				DeleteFunc: func(obj interface{}) {
-					skey, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-					if err != nil {
-						log.Printf("failed to fetch Secret key: %v", err)
-						return
-					}
-
-					ns, name, err := cache.SplitMetaNamespaceKey(skey)
-					if err != nil {
-						log.Printf("failed to get namespace and name from key: %v", err)
-						return
-					}
-
-					ssecret, err := c.ssclient.SealedSecrets(ns).Get(context.Background(), name, metav1.GetOptions{})
-					if err != nil {
-						if !k8serrors.IsNotFound(err) {
-							log.Printf("failed to get SealedSecret: %v", err)
-						}
-						return
-					}
-
-					if !metav1.IsControlledBy(obj.(*corev1.Secret), ssecret) && !isAnnotatedToBeManaged(obj.(*corev1.Secret)) {
-						return
-					}
-
-					sskey, err := cache.MetaNamespaceKeyFunc(ssecret)
-					if err != nil {
-						log.Printf("failed to fetch SealedSecret key: %v", err)
-						return
-					}
-
-					c.queue.Add(sskey)
-				},
+				DeleteFunc: c.deleteSecret,
 			})
 			if err != nil {
 				log.Printf("could not add event handler to secrets informer: %v", err)
@@ -185,6 +153,40 @@ func (c *Controller) add(obj interface{}) {
 	}
 }
 
+func (c *Controller) deleteSecret(obj interface{}) {
+	skey, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		log.Printf("failed to fetch Secret key: %v", err)
+		return
+	}
+
+	ns, name, err := cache.SplitMetaNamespaceKey(skey)
+	if err != nil {
+		log.Printf("failed to get namespace and name from key: %v", err)
+		return
+	}
+
+	ssecret, err := c.ssclient.SealedSecrets(ns).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		if !k8serrors.IsNotFound(err) {
+			log.Printf("failed to get SealedSecret: %v", err)
+		}
+		return
+	}
+
+	if !metav1.IsControlledBy(obj.(*corev1.Secret), ssecret) && !isAnnotatedToBeManaged(obj.(*corev1.Secret)) {
+		return
+	}
+
+	sskey, err := cache.MetaNamespaceKeyFunc(ssecret)
+	if err != nil {
+		log.Printf("failed to fetch SealedSecret key: %v", err)
+		return
+	}
+
+	c.queue.Add(sskey)
+}
+
 func (c *Controller) update(oldObj, newObj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(newObj)
 	if err == nil {
@@ -192,7 +194,7 @@ func (c *Controller) update(oldObj, newObj interface{}) {
 	}
 }
 
-func(c *Controller) delete(obj interface{}) {
+func (c *Controller) delete(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err == nil {
 		c.queue.Add(key)
