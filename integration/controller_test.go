@@ -27,6 +27,7 @@ import (
 
 	ssv1alpha1 "github.com/bitnami-labs/sealed-secrets/pkg/apis/sealedsecrets/v1alpha1"
 	ssclient "github.com/bitnami-labs/sealed-secrets/pkg/client/clientset/versioned"
+	"github.com/bitnami-labs/sealed-secrets/pkg/controller"
 	"github.com/bitnami-labs/sealed-secrets/pkg/crypto"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -103,6 +104,19 @@ func containEventWithReason(matcher types.GomegaMatcher) types.GomegaMatcher {
 			matcher,
 		)),
 	)
+}
+
+func waitForSecretsReUnseal(c corev1.CoreV1Interface, ssc ssclient.Interface, ns, secretName string) {
+	Eventually(func() (*v1.Event) {
+		events, err := c.Events(ns).List(context.Background(), metav1.ListOptions{})
+		Expect(err).ToNot(HaveOccurred())
+		for _, ev := range events.Items {
+			if ev.InvolvedObject.Kind == "SealedSecret" && ev.Reason == controller.SuccessReUnsealed {
+				return &ev
+			}
+		}
+		return nil
+	})
 }
 
 var _ = Describe("create", func() {
@@ -282,7 +296,7 @@ var _ = Describe("create", func() {
 				Eventually(func() (*v1.EventList, error) {
 					return c.Events(ns).Search(scheme.Scheme, ss)
 				}, Timeout, PollingInterval).Should(
-					containEventWithReason(Equal("Unsealed")),
+					containEventWithReason(HaveSuffix("Unsealed")),
 				)
 				Eventually(func() (*v1.Secret, error) {
 					return c.Secrets(ns).Get(ctx, secretName, metav1.GetOptions{})
@@ -300,6 +314,9 @@ var _ = Describe("create", func() {
 				Eventually(func() (*v1.Secret, error) {
 					return c.Secrets(ns).Get(ctx, secretName, metav1.GetOptions{})
 				}, Timeout, PollingInterval).Should(WithTransform(getFirstOwnerName, Equal(ss.GetName())))
+
+				waitForSecretsReUnseal(c, ssc, ns, secretName)
+
 				err := c.Secrets(ns).Delete(ctx, secretName, metav1.DeleteOptions{})
 				Expect(err).NotTo(HaveOccurred())
 			})
@@ -329,6 +346,8 @@ var _ = Describe("create", func() {
 				c.Secrets(ns).Create(ctx, s, metav1.CreateOptions{})
 			})
 			JustBeforeEach(func() {
+				waitForSecretsReUnseal(c, ssc, ns, secretName)
+
 				err := c.Secrets(ns).Delete(ctx, secretName, metav1.DeleteOptions{})
 				Expect(err).NotTo(HaveOccurred())
 			})
@@ -356,6 +375,8 @@ var _ = Describe("create", func() {
 				c.Secrets(ns).Create(ctx, s, metav1.CreateOptions{})
 			})
 			JustBeforeEach(func() {
+				waitForSecretsReUnseal(c, ssc, ns, secretName)
+
 				err := c.Secrets(ns).Delete(ctx, secretName, metav1.DeleteOptions{})
 				Expect(err).NotTo(HaveOccurred())
 			})

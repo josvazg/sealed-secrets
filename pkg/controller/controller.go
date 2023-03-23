@@ -39,8 +39,12 @@ const (
 	maxRetries = 5
 
 	// SuccessUnsealed is used as part of the Event 'reason' when
-	// a SealedSecret is unsealed successfully.
+	// a SealedSecret is unsealed successfully due to a create.
 	SuccessUnsealed = "Unsealed"
+
+	// SuccessReUnsealed is used as part of the Event 'reason' when
+	// a SealedSecret is unsealed successfully due to an update.
+	SuccessReUnsealed = "Re-Unsealed"
 
 	// ErrUpdateFailed is used as part of the Event 'reason' when
 	// a SealedSecret fails to update the target Secret for a
@@ -314,9 +318,11 @@ func (c *Controller) unseal(ctx context.Context, key string) (unsealErr error) {
 		return err
 	}
 
+	secretCreated := false
 	secret, err := c.sclient.Secrets(ssecret.GetObjectMeta().GetNamespace()).Get(ctx, newSecret.GetObjectMeta().GetName(), metav1.GetOptions{})
 	if k8serrors.IsNotFound(err) {
 		secret, err = c.sclient.Secrets(ssecret.GetObjectMeta().GetNamespace()).Create(ctx, newSecret, metav1.CreateOptions{})
+		secretCreated = true
 	}
 	if err != nil {
 		c.recorder.Event(ssecret, corev1.EventTypeWarning, ErrUpdateFailed, err.Error())
@@ -349,7 +355,11 @@ func (c *Controller) unseal(ctx context.Context, key string) (unsealErr error) {
 		}
 	}
 
-	c.recorder.Event(ssecret, corev1.EventTypeNormal, SuccessUnsealed, "SealedSecret unsealed successfully")
+	if secretCreated {
+		c.recorder.Event(ssecret, corev1.EventTypeNormal, SuccessUnsealed, "SealedSecret unsealed successfully")
+	} else {
+		c.recorder.Event(ssecret, corev1.EventTypeNormal, SuccessReUnsealed, "SealedSecret re-unsealed successfully")
+	}
 	return nil
 }
 
